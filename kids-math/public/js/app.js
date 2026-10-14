@@ -627,8 +627,18 @@ $("switchLearnerBtn").onclick = () => {
   renderProfiles();
 };
 
+// Reset needs a second tap, so a child cannot wipe progress by accident.
+let resetArmed = false;
 $("resetBtn").onclick = () => {
-  if (!learner || !confirm(`Start again from the beginning for ${learner.name}?`)) return;
+  if (!learner) return;
+  if (!resetArmed) {
+    resetArmed = true;
+    $("resetBtn").textContent = `Tap again to reset ${learner.name}`;
+    setTimeout(() => { resetArmed = false; $("resetBtn").textContent = "Reset this learner"; }, 4000);
+    return;
+  }
+  resetArmed = false;
+  $("resetBtn").textContent = "Reset this learner";
   learner.progress = newProgress();
   persist();
   $("settingsDialog").close();
