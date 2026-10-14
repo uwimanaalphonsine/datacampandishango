@@ -1,0 +1,20 @@
+{
+  "name": "ishango-math",
+  "version": "1.0.0",
+  "description": "Fun everyday-objects maths for young children, with an AI tutor",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0"
+  }
+}
