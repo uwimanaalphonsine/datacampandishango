@@ -1,1 +1,4 @@
 node_modules/
+data/
+# The repository-wide Python .gitignore skips lib/ folders; this one is source code.
+!lib/

@@ -1,145 +1,35 @@
-// Serves the app and the optional AI tutor endpoints.
+// Serves the app, grown-ups' accounts, children's saved work, and the
+// optional AI tutor.
 //
-//   npm start                      -> http://localhost:3000
+//   npm start                       -> http://localhost:3000
 //   ANTHROPIC_API_KEY=... npm start -> same, with the AI tutor switched on
 //
-// The browser never sees the API key: it talks to this server, which talks to
-// Claude. Everything still works without a key, using built-in feedback.
+// A parent or teacher registers and logs in; each child is a profile inside
+// that account, and every child's progress is saved on this server (in
+// data/db.json by default). The browser never sees the API key.
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import Anthropic from "@anthropic-ai/sdk";
+import { Store } from "./lib/store.js";
+import { HttpError } from "./lib/http-error.js";
+import {
+  hashPassword, verifyPassword, createSession, sessionUser, endSession,
+  readCookie, sessionCookie, COOKIE_NAME, LoginLimiter,
+} from "./lib/auth.js";
+import { MODEL, feedback, readDigits, report } from "./lib/tutor.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(here, "public");
-const PORT = Number(process.env.PORT) || 3000;
-const MODEL = "claude-opus-5-5";
 const MAX_BODY = 1_500_000; // handwriting images are small PNGs
+const MAX_CHILDREN = 40;
+const MAX_CHILD_DATA = 100_000;
 
-const aiEnabled = process.env.KIDS_MATH_AI !== "off" &&
-  Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_PROFILE);
-const client = aiEnabled ? new Anthropic() : null;
-
-const TUTOR_SYSTEM = `You are "Bibi", a warm, patient maths helper inside a learning game for children aged 4 to 8 who are just starting school.
-Rules:
-- Use very short, simple sentences (at most 2 sentences, under 30 words). Many children cannot read yet, so the text is read aloud.
-- Talk about the real objects in the problem (pens, potatoes, beans, small stones, mangoes, eggs).
-- Praise effort and good thinking, never just speed. Never say the child is wrong or bad; say "not yet" or "let's look again".
-- When giving a hint, NEVER say the final answer or any number that equals it. Suggest a way to find it: touching and counting, counting on, covering objects, sharing one at a time, or skip-counting groups.
-- If the child's answer shows a common mistake (counting one too many, adding instead of taking away, off by one group), gently point the child towards it without naming the answer.`;
-
-const FEEDBACK_SCHEMA = {
-  type: "object",
-  properties: { message: { type: "string" } },
-  required: ["message"],
-  additionalProperties: false,
-};
-
-const DIGITS_SCHEMA = {
-  type: "object",
-  properties: {
-    digits: { type: "string", description: "The number written, digits only, or empty if unreadable" },
-    confident: { type: "boolean" },
-  },
-  required: ["digits", "confident"],
-  additionalProperties: false,
-};
-
-const REPORT_SCHEMA = {
-  type: "object",
-  properties: { summary: { type: "string" } },
-  required: ["summary"],
-  additionalProperties: false,
-};
-
-// One structured call to Claude. Low effort keeps replies quick so a child is
-// never left waiting; the default fallback re-runs a declined request on
-// another model instead of returning nothing.
-async function askClaude({ system, content, schema }) {
-  const response = await client.beta.messages.create({
-    model: MODEL,
-    max_tokens: 16000,
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-    output_config: { effort: "low", format: { type: "json_schema", schema } },
-    system,
-    messages: [{ role: "user", content }],
-  });
-  if (response.stop_reason === "refusal" || response.stop_reason === "max_tokens") {
-    throw new Error(`Claude stopped early: ${response.stop_reason}`);
-  }
-  const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-  return JSON.parse(text);
-}
-
-// The game decides right and wrong; the AI only chooses the words. A hint that
-// gives the answer away is replaced by the game's own hint.
-function leaksAnswer(message, problem) {
-  const answer = String(problem.answer);
-  const givenNumbers = [problem.a, problem.b].map(String);
-  if (givenNumbers.includes(answer)) return false;
-  return new RegExp(`(^|\\D)${answer}(\\D|$)`).test(message);
-}
-
-async function feedback(body) {
-  const { problem, childAnswer, status, attempt, childName, recentNote } = body;
-  if (!problem || typeof problem.story !== "string" || !Number.isFinite(problem.answer)) {
-    throw new HttpError(400, "problem is required");
-  }
-  const facts = [
-    `Child's name: ${String(childName || "friend").slice(0, 30)}`,
-    `Topic: ${problem.topic}, level ${problem.level} of 5`,
-    `Problem shown: "${problem.story}" (${problem.equation})`,
-    `Correct answer (secret, for you only): ${problem.answer}`,
-    `Child answered: ${String(childAnswer ?? "").slice(0, 5)}`,
-    `Result: ${status === "correct" ? "CORRECT" : "NOT YET"}, try number ${Number(attempt) || 1}`,
-    recentNote ? `Recently: ${String(recentNote).slice(0, 200)}` : "",
-  ].filter(Boolean).join("\n");
-  const task = status === "correct"
-    ? "Write a short, specific celebration of how the child solved it."
-    : "Write a gentle hint that helps the child find the answer themselves. Do not reveal the answer.";
-  const out = await askClaude({ system: TUTOR_SYSTEM, content: `${facts}\n\n${task}`, schema: FEEDBACK_SCHEMA });
-  const message = String(out.message || "").trim();
-  if (!message || (status !== "correct" && leaksAnswer(message, problem))) return { message: null };
-  return { message };
-}
-
-async function readDigits(body) {
-  const match = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(String(body.image || ""));
-  if (!match) throw new HttpError(400, "image must be a PNG data URL");
-  const out = await askClaude({
-    system: "You read numbers handwritten by young children on a touch screen. Children's digits are often wobbly, large, or reversed (a backwards 3 or 7 is still 3 or 7).",
-    content: [
-      { type: "image", source: { type: "base64", media_type: "image/png", data: match[1] } },
-      { type: "text", text: "What number did the child write? Reply with digits only. If nothing readable is written, reply with an empty string." },
-    ],
-    schema: DIGITS_SCHEMA,
-  });
-  const digits = String(out.digits || "").replace(/\D/g, "").slice(0, 3);
-  return { digits, confident: Boolean(out.confident) };
-}
-
-async function report(body) {
-  const name = String(body.name || "The child").slice(0, 30);
-  const stats = JSON.stringify(body.stats || {}).slice(0, 4000);
-  const out = await askClaude({
-    system: "You write short, encouraging progress notes for parents and teachers of young children learning early maths. Plain language, no jargon, 4 to 6 sentences: what is going well, what to practise next, and one simple activity to try at home with everyday objects.",
-    content: `Child: ${name}\nProgress by topic (level is 1 to 5; percentages are of problems tried):\n${stats}`,
-    schema: REPORT_SCHEMA,
-  });
-  return { summary: String(out.summary || "") };
-}
-
-// ---------------------------------------------------------------------------
-// HTTP plumbing
-
-class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
-}
-
-const ROUTES = { "/api/feedback": feedback, "/api/read-digits": readDigits, "/api/report": report };
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CHILD_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} '.-]{0,19}$/u;
 
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -147,59 +37,237 @@ const TYPES = {
   ".png": "image/png", ".ico": "image/x-icon",
 };
 
+export async function createApp({ dataFile, aiClient = null, secureCookies = false }) {
+  const store = await new Store(dataFile).load();
+  const limiter = new LoginLimiter();
+  // Used when an email is unknown, so a failed login takes the same time
+  // whether or not the account exists.
+  const dummyHash = await hashPassword("not-a-real-password");
+
+  const publicUser = (u) => ({ name: u.name, email: u.email });
+
+  function setSession(req, res, token) {
+    const secure = secureCookies || req.headers["x-forwarded-proto"] === "https";
+    res.setHeader("set-cookie", sessionCookie(token, { secure }));
+  }
+
+  function requireUser(req) {
+    const user = sessionUser(store, readCookie(req, COOKIE_NAME));
+    if (!user) throw new HttpError(401, "Please log in.");
+    return user;
+  }
+
+  function childName(raw) {
+    const name = decodeURIComponent(raw).trim();
+    if (!CHILD_NAME_RE.test(name)) throw new HttpError(400, "A child's name can have letters, numbers and spaces, up to 20 characters.");
+    return name;
+  }
+
+  // --- Accounts --------------------------------------------------------------
+
+  async function register(req, res, body) {
+    const name = String(body.name || "").trim().slice(0, 40);
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    if (!name) throw new HttpError(400, "Please type your name.");
+    if (!EMAIL_RE.test(email) || email.length > 120) throw new HttpError(400, "Please type a valid email address.");
+    if (password.length < 8 || password.length > 200) throw new HttpError(400, "The password needs at least 8 characters.");
+    if (store.findUserByEmail(email)) throw new HttpError(409, "An account with this email already exists. Please log in.");
+    const user = {
+      id: randomUUID(), name, email, passwordHash: await hashPassword(password),
+      createdAt: new Date().toISOString(), children: {},
+    };
+    // Checked again after the slow hash, in case of two quick sign-ups.
+    if (store.findUserByEmail(email)) throw new HttpError(409, "An account with this email already exists. Please log in.");
+    store.data.users[user.id] = user;
+    const token = createSession(store, user.id);
+    await store.save();
+    setSession(req, res, token);
+    return { user: publicUser(user), children: {} };
+  }
+
+  async function login(req, res, body) {
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const key = `${req.socket.remoteAddress}|${email}`;
+    if (limiter.blocked(key)) throw new HttpError(429, "Too many tries. Please wait 15 minutes and try again.");
+    const user = store.findUserByEmail(email);
+    const ok = await verifyPassword(password, user ? user.passwordHash : dummyHash);
+    if (!user || !ok) {
+      limiter.fail(key);
+      throw new HttpError(401, "That email or password is not right.");
+    }
+    limiter.clear(key);
+    const token = createSession(store, user.id);
+    await store.save();
+    setSession(req, res, token);
+    return { user: publicUser(user), children: user.children };
+  }
+
+  async function logout(req, res) {
+    endSession(store, readCookie(req, COOKIE_NAME));
+    await store.save();
+    setSession(req, res, "");
+    return { ok: true };
+  }
+
+  function me(req) {
+    const user = requireUser(req);
+    return { user: publicUser(user), children: user.children };
+  }
+
+  // --- Children's work -------------------------------------------------------
+
+  async function saveChild(req, res, body, rawName) {
+    const user = requireUser(req);
+    const name = childName(rawName);
+    const isNew = !Object.hasOwn(user.children, name);
+    if (isNew && Object.keys(user.children).length >= MAX_CHILDREN) {
+      throw new HttpError(400, `An account can have up to ${MAX_CHILDREN} children.`);
+    }
+    const { progress, settings } = body;
+    if (typeof progress !== "object" || progress === null || typeof settings !== "object" || settings === null) {
+      throw new HttpError(400, "progress and settings are required.");
+    }
+    if (JSON.stringify({ progress, settings }).length > MAX_CHILD_DATA) throw new HttpError(413, "Saved work is too large.");
+    user.children[name] = { progress, settings, updatedAt: new Date().toISOString() };
+    await store.save();
+    return { ok: true };
+  }
+
+  async function deleteChild(req, res, body, rawName) {
+    const user = requireUser(req);
+    delete user.children[childName(rawName)];
+    await store.save();
+    return { ok: true };
+  }
+
+  // --- AI tutor (logged-in users only, so the API key cannot be misused) -----
+
+  const aiRoute = (fn) => async (req, res, body) => {
+    requireUser(req);
+    if (!aiClient) throw new HttpError(503, "The AI tutor is not set up on this server.");
+    try {
+      return await fn(aiClient, body);
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      if (err instanceof Anthropic.RateLimitError) throw new HttpError(429, "The AI tutor is busy. Try again soon.");
+      console.error("AI request failed:", err.message);
+      throw new HttpError(502, "The AI tutor is not available right now.");
+    }
+  };
+
+  const ROUTES = {
+    "POST /api/register": register,
+    "POST /api/login": login,
+    "POST /api/logout": logout,
+    "GET /api/me": me,
+    "PUT /api/children/:name": saveChild,
+    "DELETE /api/children/:name": deleteChild,
+    "POST /api/feedback": aiRoute(feedback),
+    "POST /api/read-digits": aiRoute(readDigits),
+    "POST /api/report": aiRoute(report),
+  };
+
+  function findRoute(method, pathname) {
+    if (ROUTES[`${method} ${pathname}`]) return [ROUTES[`${method} ${pathname}`], []];
+    const m = /^\/api\/children\/([^/]+)$/.exec(pathname);
+    if (m && ROUTES[`${method} /api/children/:name`]) return [ROUTES[`${method} /api/children/:name`], [m[1]]];
+    return [null, []];
+  }
+
+  // Requests that change data must be same-site JSON. Browsers will not send
+  // a cross-site JSON request with cookies without permission, which blocks
+  // other websites from acting as a logged-in grown-up.
+  function checkWriteRequest(req) {
+    if (req.method === "GET") return;
+    if (!String(req.headers["content-type"] || "").startsWith("application/json")) {
+      throw new HttpError(415, "Send JSON.");
+    }
+    const origin = req.headers.origin;
+    if (origin && new URL(origin).host !== req.headers.host) throw new HttpError(403, "Cross-site request refused.");
+  }
+
+  return http.createServer(async (req, res) => {
+    const { pathname } = new URL(req.url, "http://localhost");
+    if (pathname === "/api/status") return sendJson(res, 200, { ai: Boolean(aiClient), accounts: true });
+    if (!pathname.startsWith("/api/")) {
+      return req.method === "GET" ? serveStatic(res, pathname) : sendJson(res, 405, { error: "Method not allowed." });
+    }
+    const [handler, params] = findRoute(req.method, pathname);
+    if (!handler) return sendJson(res, 404, { error: "Not found." });
+    try {
+      checkWriteRequest(req);
+      const body = req.method === "GET" ? {} : await readBody(req);
+      sendJson(res, 200, await handler(req, res, body, ...params));
+    } catch (err) {
+      if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
+      console.error(`${req.method} ${pathname} failed:`, err);
+      sendJson(res, 500, { error: "Something went wrong. Please try again." });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(new HttpError(413, "body too large")); req.destroy(); return; }
+      if (size > MAX_BODY) { reject(new HttpError(413, "Request too large.")); req.destroy(); return; }
       chunks.push(c);
     });
     req.on("end", () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); }
-      catch { reject(new HttpError(400, "invalid JSON")); }
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        resolve(body && typeof body === "object" ? body : {});
+      } catch {
+        reject(new HttpError(400, "Invalid JSON."));
+      }
     });
     req.on("error", reject);
   });
 }
 
 function sendJson(res, status, data) {
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(data));
 }
 
-async function serveStatic(req, res, pathname) {
-  const rel = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
+async function serveStatic(res, pathname) {
+  let rel;
+  try {
+    rel = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
+  } catch {
+    return sendJson(res, 400, { error: "Bad path." });
+  }
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
-  if (!file.startsWith(PUBLIC_DIR + path.sep)) return sendJson(res, 403, { error: "forbidden" });
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) return sendJson(res, 403, { error: "Forbidden." });
   try {
     const data = await fs.readFile(file);
     res.writeHead(200, { "content-type": TYPES[path.extname(file)] || "application/octet-stream" });
     res.end(data);
   } catch {
-    sendJson(res, 404, { error: "not found" });
+    sendJson(res, 404, { error: "Not found." });
   }
 }
 
-const server = http.createServer(async (req, res) => {
-  const { pathname } = new URL(req.url, "http://localhost");
-  if (pathname === "/api/status") return sendJson(res, 200, { ai: aiEnabled });
-  const handler = ROUTES[pathname];
-  if (!handler) return req.method === "GET" ? serveStatic(req, res, pathname) : sendJson(res, 404, { error: "not found" });
-  if (req.method !== "POST") return sendJson(res, 405, { error: "use POST" });
-  if (!aiEnabled) return sendJson(res, 503, { error: "AI tutor is not configured" });
-  try {
-    sendJson(res, 200, await handler(await readBody(req)));
-  } catch (err) {
-    if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
-    if (err instanceof Anthropic.RateLimitError) return sendJson(res, 429, { error: "AI tutor is busy" });
-    console.error("AI request failed:", err.message);
-    sendJson(res, 502, { error: "AI tutor unavailable" });
-  }
-});
+// ---------------------------------------------------------------------------
 
-server.listen(PORT, () => {
-  console.log(`Ishango Maths is running at http://localhost:${PORT}`);
-  console.log(aiEnabled ? `AI tutor: on (${MODEL})` : "AI tutor: off (set ANTHROPIC_API_KEY to switch it on)");
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const port = Number(process.env.PORT) || 3000;
+  const aiOn = process.env.KIDS_MATH_AI !== "off" &&
+    Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_PROFILE);
+  const server = await createApp({
+    dataFile: process.env.DATA_FILE || path.join(here, "data", "db.json"),
+    aiClient: aiOn ? new Anthropic() : null,
+    secureCookies: process.env.COOKIE_SECURE === "1",
+  });
+  server.listen(port, () => {
+    console.log(`Ishango Maths is running at http://localhost:${port}`);
+    console.log(aiOn ? `AI tutor: on (${MODEL})` : "AI tutor: off (set ANTHROPIC_API_KEY to switch it on)");
+  });
+}

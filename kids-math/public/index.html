@@ -12,12 +12,40 @@
     <button class="icon-btn" id="homeBtn" aria-label="Home" hidden>🏠</button>
     <h1 class="brand">Ishango <span>Maths</span></h1>
     <div class="topbar-right">
+      <span class="save-status" id="saveStatus" role="status" hidden></span>
       <span class="stars" id="starCount" hidden>⭐ 0</span>
       <button class="icon-btn" id="settingsBtn" aria-label="Grown-ups settings">⚙️</button>
     </div>
   </header>
 
   <main>
+    <!-- Grown-ups log in or create an account -->
+    <section class="screen" id="screen-auth" hidden>
+      <h2 class="big-title">Welcome to Ishango Maths</h2>
+      <p class="subtitle">Grown-ups: log in to keep every child's work safe.</p>
+      <div class="card auth-card">
+        <div class="tabs" role="tablist">
+          <button class="tab active" role="tab" type="button" id="tabLogin" aria-selected="true">Log in</button>
+          <button class="tab" role="tab" type="button" id="tabRegister" aria-selected="false">Create account</button>
+        </div>
+        <form id="authForm" class="auth-form" novalidate>
+          <label id="authNameRow" hidden>Your name
+            <input id="authName" maxlength="40" autocomplete="name">
+          </label>
+          <label>Email
+            <input id="authEmail" type="email" maxlength="120" autocomplete="email" required>
+          </label>
+          <label>Password
+            <input id="authPassword" type="password" minlength="8" maxlength="200" autocomplete="current-password" required>
+          </label>
+          <p class="hint-text" id="authHint">Use the email and password you signed up with.</p>
+          <p class="form-error" id="authError" role="alert" hidden></p>
+          <button class="btn primary big" type="submit" id="authSubmit">Log in</button>
+        </form>
+      </div>
+      <p class="muted center">A parent or teacher makes one account. Each child gets their own profile inside it.</p>
+    </section>
+
     <!-- Who is learning? -->
     <section class="screen" id="screen-profiles">
       <h2 class="big-title">Who is learning today?</h2>
@@ -125,6 +153,10 @@
       <div class="row">
         <button class="btn ghost" type="button" id="switchLearnerBtn">👥 Switch learner</button>
         <button class="btn danger" type="button" id="resetBtn">Reset this learner</button>
+      </div>
+      <div class="account-row" id="accountRow" hidden>
+        <p class="muted" id="accountText"></p>
+        <button class="btn ghost" type="button" id="logoutBtn">Log out</button>
       </div>
       <button class="btn primary" value="close">Done</button>
     </form>

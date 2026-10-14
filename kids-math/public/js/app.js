@@ -5,28 +5,46 @@ import {
 import { objectSvg, childSvg } from "./objects.js";
 
 const $ = (id) => document.getElementById(id);
-const STORE_KEY = "ishango-math-v1";
 const DEFAULT_SETTINGS = { thinkSeconds: 20, voice: true, ai: true };
+const LOCAL_KEY = "ishango-math-v1"; // children's work when there is no server (offline demo)
+const CURRENT_KEY = "ishango-math-current"; // which child last played on this device
+const CHILD_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} '.-]{0,19}$/u; // same rule as the server
 
-// ---------------------------------------------------------------------------
-// Saved data (per device). Wrapped so the app still works in private mode.
-
-function loadStore() {
-  try {
-    const data = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (data && data.profiles) return data;
-  } catch { /* ignore */ }
-  return { profiles: {}, current: null };
-}
-function saveStore() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { /* ignore */ }
-}
-
-const store = loadStore();
+// "server": every child's work is saved to the grown-up's account.
+// "local": no server to talk to (e.g. the web preview), so work stays in this browser.
+let mode = "local";
+let account = null; // { name, email } once a grown-up has logged in
+const store = { profiles: {}, current: null };
 let learner = null; // { name, progress, settings }
 let aiAvailable = false;
 
+function readLocal(key) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
+}
+function writeLocal(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode */ }
+}
+const currentKey = () => `${CURRENT_KEY}:${account?.email || ""}`;
+
+// Small fetch wrapper: never throws, so callers can show a friendly message.
+async function request(method, path, body) {
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: body ? { "content-type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: "same-origin",
+    });
+    let data = null;
+    try { data = await res.json(); } catch { /* not JSON */ }
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
 function useLearner(name) {
+  const isNew = !Object.hasOwn(store.profiles, name);
   const saved = store.profiles[name] || {};
   learner = {
     name,
@@ -34,11 +52,58 @@ function useLearner(name) {
     settings: { ...DEFAULT_SETTINGS, ...(saved.settings || {}) },
   };
   store.current = name;
-  persist();
+  if (mode === "server") writeLocal(currentKey(), name);
+  if (isNew || mode === "local") persist();
 }
+
+// Saves the current child's work. On a server, saves are grouped for a
+// moment and retried if the connection drops, with a small status in the
+// top bar so grown-ups can see the work is safe.
+const pending = new Set();
+let saveTimer = null;
+let saving = false;
+
 function persist() {
-  if (learner) store.profiles[learner.name] = { progress: learner.progress, settings: learner.settings };
-  saveStore();
+  if (!learner) return;
+  store.profiles[learner.name] = { progress: learner.progress, settings: learner.settings };
+  if (mode === "local") {
+    writeLocal(LOCAL_KEY, store);
+    return;
+  }
+  pending.add(learner.name);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSaves, 400);
+}
+
+async function flushSaves() {
+  if (saving) { saveTimer = setTimeout(flushSaves, 400); return; }
+  if (!pending.size) return;
+  saving = true;
+  setSaveStatus("Saving…");
+  try {
+    for (const name of [...pending]) {
+      pending.delete(name);
+      const res = await request("PUT", `/api/children/${encodeURIComponent(name)}`, store.profiles[name]);
+      if (res.status === 401) { pending.add(name); sessionExpired(); return; }
+      if (!res.ok) {
+        pending.add(name);
+        setSaveStatus("⚠ Not saved yet", true);
+        saveTimer = setTimeout(flushSaves, 10_000);
+        return;
+      }
+    }
+    setSaveStatus("✓ Saved");
+    setTimeout(() => { if (!pending.size && !saving) setSaveStatus(""); }, 2000);
+  } finally {
+    saving = false;
+  }
+}
+
+function setSaveStatus(text, bad = false) {
+  const el = $("saveStatus");
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("bad", bad);
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +128,7 @@ async function api(path, body, timeoutMs = 8000) {
   try {
     const res = await fetch(path, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify(body), signal: ctrl.signal,
+      body: JSON.stringify(body), signal: ctrl.signal, credentials: "same-origin",
     });
     return res.ok ? await res.json() : null;
   } catch {
@@ -73,22 +138,149 @@ async function api(path, body, timeoutMs = 8000) {
   }
 }
 
-async function checkAiStatus() {
-  try {
-    const res = await fetch("/api/status");
-    aiAvailable = res.ok && (await res.json()).ai === true;
-  } catch {
-    aiAvailable = false;
+// ---------------------------------------------------------------------------
+// Grown-ups' accounts
+
+let authMode = "login";
+
+function setAuthMode(m) {
+  authMode = m;
+  const reg = m === "register";
+  $("tabLogin").classList.toggle("active", !reg);
+  $("tabRegister").classList.toggle("active", reg);
+  $("tabLogin").setAttribute("aria-selected", String(!reg));
+  $("tabRegister").setAttribute("aria-selected", String(reg));
+  $("authNameRow").hidden = !reg;
+  $("authPassword").autocomplete = reg ? "new-password" : "current-password";
+  $("authSubmit").textContent = reg ? "Create account" : "Log in";
+  $("authHint").textContent = reg
+    ? "Choose a password with at least 8 characters. Keep it away from the children."
+    : "Use the email and password you signed up with.";
+  $("authError").hidden = true;
+}
+$("tabLogin").onclick = () => setAuthMode("login");
+for (const id of ["authName", "authEmail", "authPassword"]) $(id).addEventListener("input", () => { $("authError").hidden = true; });
+$("tabRegister").onclick = () => setAuthMode("register");
+
+function showAuth(message = "") {
+  learner = null;
+  $("authError").hidden = !message;
+  $("authError").textContent = message;
+  show("auth");
+  $(authMode === "register" ? "authName" : "authEmail").focus();
+}
+
+$("authForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const reg = authMode === "register";
+  const name = $("authName").value.trim();
+  const email = $("authEmail").value.trim();
+  const password = $("authPassword").value;
+  let problem = "";
+  if (reg && !name) problem = "Please type your name.";
+  else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) problem = "Please type a valid email address.";
+  else if (password.length < 8) problem = "The password needs at least 8 characters.";
+  if (problem) { showAuthError(problem); return; }
+
+  $("authSubmit").disabled = true;
+  const res = await request("POST", reg ? "/api/register" : "/api/login", reg ? { name, email, password } : { email, password });
+  $("authSubmit").disabled = false;
+  if (!res.ok) {
+    showAuthError(res.data?.error || "Could not reach the server. Check the internet connection and try again.");
+    return;
   }
+  $("authPassword").value = "";
+  $("authError").hidden = true;
+  enterAccount(res.data);
+};
+
+function showAuthError(text) {
+  $("authError").textContent = text;
+  $("authError").hidden = false;
+}
+
+// Work that could not be saved before a login expired is kept here and
+// saved again once the same grown-up logs back in.
+let unsaved = null;
+
+function enterAccount({ user, children }) {
+  const sameAccount = unsaved && unsaved.email === user.email;
+  account = user;
+  store.profiles = children || {};
+  if (sameAccount) {
+    for (const [name, data] of Object.entries(unsaved.profiles)) {
+      store.profiles[name] = data;
+      pending.add(name);
+    }
+    flushSaves();
+  }
+  unsaved = null;
+  store.current = readLocal(currentKey());
+  startLearner();
+}
+
+function sessionExpired() {
+  unsaved = { email: account?.email, profiles: Object.fromEntries([...pending].map((n) => [n, store.profiles[n]])) };
+  pending.clear();
+  setSaveStatus("");
+  showAuth("Please log in again to keep saving.");
+}
+
+$("logoutBtn").onclick = async () => {
+  clearTimeout(saveTimer);
+  await flushSaves();
+  if (pending.size) {
+    $("accountText").textContent = "Some work is not saved yet. Check the internet connection, then try again.";
+    return;
+  }
+  await request("POST", "/api/logout", {});
+  $("settingsDialog").close();
+  account = null;
+  learner = null;
+  store.profiles = {};
+  store.current = null;
+  setSaveStatus("");
+  setAuthMode("login");
+  showAuth();
+};
+
+function startLearner() {
+  if (store.current && Object.hasOwn(store.profiles, store.current)) {
+    useLearner(store.current);
+    renderHome();
+  } else {
+    renderProfiles();
+  }
+  updateWriteNote();
+}
+
+// With a server, grown-ups log in; without one (the web preview), the app
+// runs on its own and keeps work in this browser.
+async function boot() {
+  const status = await request("GET", "/api/status");
+  if (status.ok && status.data?.accounts) {
+    mode = "server";
+    aiAvailable = status.data.ai === true;
+    const me = await request("GET", "/api/me");
+    if (me.ok) enterAccount(me.data);
+    else showAuth();
+    return;
+  }
+  mode = "local";
+  aiAvailable = false;
+  const saved = readLocal(LOCAL_KEY);
+  if (saved?.profiles) Object.assign(store, saved);
+  startLearner();
 }
 
 // ---------------------------------------------------------------------------
 // Screens
 
-const SCREENS = ["profiles", "home", "play", "progress"];
+const SCREENS = ["auth", "profiles", "home", "play", "progress"];
 function show(name) {
   for (const s of SCREENS) $(`screen-${s}`).hidden = s !== name;
-  $("homeBtn").hidden = name === "home" || name === "profiles";
+  $("homeBtn").hidden = name === "home" || name === "profiles" || name === "auth";
+  $("settingsBtn").hidden = name === "auth";
   $("starCount").hidden = !learner;
   if (learner) $("starCount").textContent = `⭐ ${Math.floor(learner.progress.stars)}`;
   if (name !== "play") stopThinkTimer();
@@ -98,7 +290,7 @@ function show(name) {
 function renderProfiles() {
   const list = $("profileList");
   list.innerHTML = "";
-  for (const name of Object.keys(store.profiles)) {
+  for (const name of Object.keys(store.profiles).sort()) {
     const b = document.createElement("button");
     b.className = "btn";
     b.textContent = `🙂 ${name}`;
@@ -110,9 +302,11 @@ function renderProfiles() {
 
 $("newProfileForm").onsubmit = (e) => {
   e.preventDefault();
-  const name = $("newName").value.trim().slice(0, 20);
-  if (!name) return;
-  $("newName").value = "";
+  const input = $("newName");
+  const name = input.value.trim().replace(/\s+/g, " ");
+  input.setCustomValidity(CHILD_NAME_RE.test(name) ? "" : "Use letters and numbers only, up to 20 characters.");
+  if (!input.reportValidity()) return;
+  input.value = "";
   useLearner(name);
   renderHome();
 };
@@ -606,6 +800,8 @@ $("settingsBtn").onclick = () => {
     ? "The AI tutor gives personal hints, reads handwriting and writes progress notes."
     : "The AI tutor is not set up on this server. The app works fully without it.";
   for (const id of ["setThink", "setVoice", "setAi", "resetBtn", "switchLearnerBtn"]) $(id).disabled = !learner || (id === "setAi" && !aiAvailable);
+  $("accountRow").hidden = !account;
+  if (account) $("accountText").textContent = `Logged in as ${account.name} (${account.email}). Every child's work is saved to this account.`;
   $("settingsDialog").showModal();
 };
 
@@ -623,7 +819,8 @@ $("switchLearnerBtn").onclick = () => {
   $("settingsDialog").close();
   learner = null;
   store.current = null;
-  saveStore();
+  if (mode === "local") writeLocal(LOCAL_KEY, store);
+  else writeLocal(currentKey(), null);
   renderProfiles();
 };
 
@@ -648,11 +845,4 @@ $("resetBtn").onclick = () => {
 // ---------------------------------------------------------------------------
 
 buildKeypad();
-await checkAiStatus();
-if (store.current && store.profiles[store.current]) {
-  useLearner(store.current);
-  renderHome();
-} else {
-  renderProfiles();
-}
-updateWriteNote();
+await boot();

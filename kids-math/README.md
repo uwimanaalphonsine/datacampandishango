@@ -32,6 +32,27 @@ Each topic has 5 levels (level 1 counting goes up to 5; level 5 adding goes up t
 
 Progress is saved on the device, with a separate profile for each child.
 
+## Accounts and saved work
+
+Before playing, a **parent or teacher** creates an account (name, email and password) or logs in.
+Each child then gets their own profile inside that account, so one teacher can keep a whole class,
+and a family can keep all their children, in one place.
+
+- Every child's progress is **saved on the server** after each problem, and a small "✓ Saved"
+  appears in the top bar. If the internet drops, the app keeps trying until it is saved.
+- Log in on any device (school tablet, home phone) to carry on where the child left off.
+- Each account sees only its own children.
+- **Log out** is in the grown-ups' settings (⚙️).
+
+Security: passwords are stored only as salted scrypt hashes. The login stays in an HttpOnly cookie
+for 30 days. Repeated wrong passwords are slowed down, and other websites cannot make changes
+on a logged-in grown-up's behalf. The data is kept in `data/db.json` (set `DATA_FILE` to move it).
+Back this file up. For a large number of schools, move to a proper database: all the data access
+is in `lib/store.js`.
+
+When the app is opened without its server (for example the web preview), it skips the login and
+keeps work in that browser only.
+
 ## The AI tutor (optional)
 
 With a Claude API key, the app also:
@@ -56,11 +77,15 @@ npm start                                 # http://localhost:3000, built-in feed
 ANTHROPIC_API_KEY=sk-ant-... npm start    # with the AI tutor
 ```
 
-The API key stays on the server and is never sent to the browser. Set `PORT` to change the port,
-or `KIDS_MATH_AI=off` to switch the AI off.
+The API key stays on the server and is never sent to the browser, and only logged-in grown-ups
+can use the AI tutor. Set `PORT` to change the port, or `KIDS_MATH_AI=off` to switch the AI off.
+
+When you put the app on the internet, serve it over **HTTPS** (for example behind a hosting
+service or a reverse proxy) and set `COOKIE_SECURE=1`, so passwords and logins are never sent
+unencrypted.
 
 ```bash
-npm test     # tests for the problem generator and the levelling rules
+npm test     # tests for the problem generator, levelling rules, accounts and saving
 ```
 
 ## Files
@@ -70,5 +95,8 @@ npm test     # tests for the problem generator and the levelling rules
 | `public/js/engine.js` | Problem generator, answer checking, adaptive levels (no DOM, unit tested) |
 | `public/js/app.js` | Screens, pictures, keypad, writing pad, thinking time, voice |
 | `public/js/objects.js` | Drawings of the everyday objects |
-| `server.js` | Serves the app and the AI tutor endpoints (`/api/feedback`, `/api/read-digits`, `/api/report`) |
-| `test/engine.test.js` | Unit tests |
+| `server.js` | Serves the app; account, saving and AI tutor routes |
+| `lib/auth.js` | Password hashing, login sessions, wrong-password limits |
+| `lib/store.js` | The JSON-file database of accounts and children's work |
+| `lib/tutor.js` | The AI tutor's instructions and calls to Claude |
+| `test/` | Tests for the engine and the server |
